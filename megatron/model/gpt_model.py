@@ -31,9 +31,10 @@ from .utils import scaled_init_method_normal
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 from megatron.model import LayerNorm
 from megatron.model.module import float16_to_fp32
-from .language_model import EmbeddingPipe
+from .language_model import EmbeddingPipe, LMHeadPipe
 from .transformer import ParallelTransformerLayerPipe
 
+from apex.normalization import MixedFusedRMSNorm
 
 def post_language_model_processing(lm_output, labels, logit_weights,
                                    get_key_value, parallel_output,
@@ -89,7 +90,13 @@ class GPTModel(MegatronModule):
             scaled_init_method=scaled_init_method_normal(args.init_method_std, args.num_layers),
             num_experts=args.num_experts,
             pre_process=self.pre_process,
-            post_process=self.post_process)
+            post_process=self.post_process,
+            position_embedding_type=args.position_embedding_type,
+            share_embeddings_and_output_weights=args.share_embeddings_and_output_weights,
+            activation=args.activation,
+            normalization=args.normalization,
+            bias=args.bias,
+        )
 
         self.initialize_word_embeddings(init_method_normal)
 
@@ -97,7 +104,7 @@ class GPTModel(MegatronModule):
         """See megatron.model.transformer.set_input_tensor()"""
         self.language_model.set_input_tensor(input_tensor)
 
-    def forward(self, input_ids, position_ids, attention_mask, labels=None,
+    def forward(self, input_ids, attention_mask, position_ids=None, labels=None,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
                 forward_method_parallel_output=None, curriculum_seqlen=None):
         args = get_args()
@@ -107,7 +114,8 @@ class GPTModel(MegatronModule):
                 # seqlen-based curriculum learning
                 # input_ids, position_ids, labels have size [batch size, seqlen]
                 input_ids = input_ids[:, :curriculum_seqlen].contiguous()
-                position_ids = position_ids[:, :curriculum_seqlen].contiguous()
+                if position_ids is not None:
+                    position_ids = position_ids[:, :curriculum_seqlen].contiguous()
                 if labels is not None:
                     labels = labels[:, :curriculum_seqlen].contiguous()
 
@@ -120,20 +128,20 @@ class GPTModel(MegatronModule):
 
         lm_output, *moe_losses = self.language_model(
             input_ids,
-            position_ids,
             attention_mask,
+            position_ids,
             layer_past=layer_past,
             get_key_value=get_key_value)
 
         if self.post_process:
             lm_output = post_language_model_processing(
-                    lm_output, labels,
-                    self.word_embeddings_weight(),
-                    get_key_value,
-                    self.parallel_output,
-                    forward_method_parallel_output,
-                    self.fp16_lm_cross_entropy)
-        
+                lm_output, labels,
+                self.word_embeddings_weight(),
+                get_key_value,
+                self.parallel_output,
+                forward_method_parallel_output,
+                self.fp16_lm_cross_entropy)
+
         if self.return_moe_loss:
             return (lm_output, *moe_losses)
         else:
@@ -144,7 +152,7 @@ class GPTModel(MegatronModule):
 
         state_dict_ = {}
         language_model_state_dict = self.language_model.state_dict_for_save_checkpoint(
-                destination, prefix, keep_vars)
+            destination, prefix, keep_vars)
         # MoE states need to be handled separately by DeepSpeed engine, thus
         # moving them to the top level dictionary
         if "moe_state_dict" in language_model_state_dict:
@@ -188,7 +196,7 @@ def CrossEntropy(output, labels):
     return loss
 
 
-class GPTModelPipe(PipelineModule,MegatronModule):
+class GPTModelPipe(PipelineModule, MegatronModule):
     """GPT-2 Language model."""
 
     def __init__(self,
@@ -212,16 +220,27 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         self.specs.append(_to_float16)
 
         # Embedding layer
-        self.specs.append(TiedLayerSpec('embed',
-                                        EmbeddingPipe,
+        if args.share_embeddings_and_output_weights:
+            self.specs.append(TiedLayerSpec('embed',
+                                            EmbeddingPipe,
+                                            args.hidden_size,
+                                            args.padded_vocab_size,
+                                            args.max_position_embeddings,
+                                            args.hidden_dropout,
+                                            init_method=init_method,
+                                            num_tokentypes=num_tokentypes,
+                                            position_embedding_type=args.position_embedding_type,
+                                            tied_weight_attr='word_embeddings_weight'))
+        else:
+            self.specs.append(LayerSpec(EmbeddingPipe,
                                         args.hidden_size,
                                         args.padded_vocab_size,
                                         args.max_position_embeddings,
                                         args.hidden_dropout,
                                         init_method=init_method,
                                         num_tokentypes=num_tokentypes,
-                                        tied_weight_attr='word_embeddings_weight'))
-        
+                                        position_embedding_type=args.position_embedding_type))
+
         if args.fp32_residual_connection:
             self.specs.append(lambda x: x.transpose(0, 1).contiguous().float())
         else:
@@ -230,21 +249,23 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         for layer_idx in range(args.num_layers):
             self.specs.append(
                 LayerSpec(ParallelTransformerLayerPipe,
-                    init_method=init_method,
-                    output_layer_init_method=scaled_init_method_normal(args.init_method_std,
-                                                                       args.num_layers),
-                    layer_number=layer_idx,
-                    self_attn_mask_type=AttnMaskType.causal))
-                
-        
+                          init_method=init_method,
+                          output_layer_init_method=scaled_init_method_normal(args.init_method_std, args.num_layers),
+                          layer_number=layer_idx,
+                          self_attn_mask_type=AttnMaskType.causal,
+                          normalization=args.normalization,
+                          position_embedding_type=args.position_embedding_type,
+                          activation=args.activation,
+                          bias=args.bias,))
+
         # Undo data format change
         self.specs.append(lambda x: x.transpose(0, 1).contiguous())
 
         # Final layernorm after transformer layers
-        self.specs.append(
-            LayerSpec(LayerNorm,
-                      args.hidden_size,
-                      eps=args.layernorm_epsilon))
+        if args.normalization == 'layernorm':
+            self.specs.append(LayerSpec(LayerNorm, args.hidden_size, eps=args.layernorm_epsilon))
+        else:
+            self.specs.append(LayerSpec(MixedFusedRMSNorm, args.hidden_size, args.layernorm_epsilon))
 
         def _logits_helper(embedding, lm_output):
             """A wrapper to massage inputs/outputs from pipeline. """
@@ -253,18 +274,25 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                 embedding.word_embeddings_weight,
                 self.parallel_output)
 
-        self.specs.append(
-            TiedLayerSpec('embed',
-                          EmbeddingPipe,
-                          args.hidden_size,
-                          args.padded_vocab_size,
-                          args.max_position_embeddings,
-                          args.hidden_dropout,
-                          init_method=init_method,
-                          num_tokentypes=num_tokentypes,
-                          forward_fn=_logits_helper,
-                          tied_weight_attr='word_embeddings_weight')
-        )
+        if args.share_embeddings_and_output_weights:
+            self.specs.append(
+                TiedLayerSpec('embed',
+                              EmbeddingPipe,
+                              args.hidden_size,
+                              args.padded_vocab_size,
+                              args.max_position_embeddings,
+                              args.hidden_dropout,
+                              init_method=init_method,
+                              num_tokentypes=num_tokentypes,
+                              position_embedding_type=args.position_embedding_type,
+                              forward_fn=_logits_helper,
+                              tied_weight_attr='word_embeddings_weight')
+            )
+        else:
+            self.specs.append(
+                LayerSpec(LMHeadPipe, args.hidden_size, args.padded_vocab_size, init_method,
+                          parallel_output=self.parallel_output)
+            )
 
         # Convert to fp32 if needed
         if args.fp16 or args.bf16:
@@ -274,7 +302,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
             interval = args.checkpoint_num_layers
         else:
             interval = 0
-        
+
         from deepspeed.runtime.pipe.topology import PipeModelDataParallelTopology
         topo = PipeModelDataParallelTopology(num_pp=mpu.get_pipeline_model_parallel_world_size(),
                                              num_mp=mpu.get_tensor_model_parallel_world_size(),

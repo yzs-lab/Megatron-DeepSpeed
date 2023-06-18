@@ -20,6 +20,7 @@ from abc import abstractmethod
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
+from .sp_tokenization import SPTokenizer
 
 
 def build_tokenizer(args):
@@ -29,18 +30,23 @@ def build_tokenizer(args):
               flush=True)
 
     # Select and instantiate the tokenizer.
-    assert args.vocab_file is not None
     if args.tokenizer_type == 'BertWordPieceLowerCase':
+        assert args.vocab_file is not None
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=True,
                                             vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'BertWordPieceCase':
+        assert args.vocab_file is not None
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=False,
                                             vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'GPT2BPETokenizer':
+        assert args.vocab_file is not None
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+    elif args.tokenizer_type == 'SPTokenizer':
+        assert args.tokenizer_model_file is not None
+        tokenizer = _SPTokenizer(args.tokenizer_model_file)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -279,6 +285,38 @@ class _GPT2BPETokenizer(AbstractTokenizer):
     @property
     def inv_vocab(self):
         return self.tokenizer.decoder
+
+    def tokenize(self, text):
+        return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids):
+        return self.tokenizer.decode(token_ids)
+
+    @property
+    def eod(self):
+        return self.eod_id
+
+class _SPTokenizer(AbstractTokenizer):
+    """SentencePiece tokenizer."""
+
+    def __init__(self, model_file):
+        name = 'SentencePiece'
+        super().__init__(name)
+
+        self.tokenizer = SPTokenizer(model_file)
+        self.eod_id = self.tokenizer.eos_id
+
+    @property
+    def vocab_size(self):
+        return self.tokenizer.n_words
+
+    @property
+    def vocab(self):
+        return {i:self.tokenizer.sp_model.id_to_piece(i) for i in range(self.vocab_size())}
+
+    @property
+    def inv_vocab(self):
+        return {self.tokenizer.sp_model.id_to_piece(i):i for i in range(self.vocab_size())}
 
     def tokenize(self, text):
         return self.tokenizer.encode(text)
