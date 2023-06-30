@@ -35,8 +35,11 @@ from deepspeed.accelerator.real_accelerator import get_accelerator
 import os
 import subprocess
 
-from torch import nn
+from torch import nn, einsum
 import torch.nn.functional as F
+import torch
+from einops import rearrange
+
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -64,7 +67,7 @@ def model_provider(pre_process=True, post_process=True):
             # we can reuse it.
             attention_mask = torch.tril(torch.ones(
                 (1, args.seq_length, args.seq_length), device=get_accelerator().current_device_name())).view(
-                    1, 1, args.seq_length, args.seq_length)
+                1, 1, args.seq_length, args.seq_length)
 
             # Convert attention mask to binary:
             attention_mask = (attention_mask < 0.5)
@@ -75,6 +78,21 @@ def model_provider(pre_process=True, post_process=True):
 
             # Attention mask must be bool.
             args.attn_mask = attention_mask.to(torch.bool)
+
+            # For prertaining, since sequence length is fixed, cache rotary embedding in args, to avoid communicating around
+            if args.position_embedding_type == 'rope':
+                rotary_dim = args.hidden_size // args.num_attention_heads
+                offset = 0
+                inv_freq = 1.0 / (10000 ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim))
+                seq = torch.arange(args.seq_length) + offset
+                freqs = einsum('i , j -> i j', seq.type_as(inv_freq), inv_freq)
+                rotary_pos_emb = rearrange(torch.cat((freqs, freqs), dim=-1), 'n d -> n 1 1 d')
+                if args.fp16:
+                    rotary_pos_emb = rotary_pos_emb.half()
+                elif args.bf16:
+                    rotary_pos_emb = rotary_pos_emb.bfloat16()
+                args.rotary_pos_emb = rotary_pos_emb.to(get_accelerator().current_device_name())
+
 
         else:
             model = GPTModel(
@@ -125,16 +143,16 @@ def data_post_process(data, data_sampler_state_dict):
             args.data_efficiency_curriculum_learning_seqlen_type = 'seqlen_truncate'
             current_seqlen = data_sampler_state_dict['current_difficulties']['seqlen_truncate']
             if current_seqlen < args.seq_length:
-                data['text'] = data['text'][:, :(current_seqlen+1)].contiguous()
+                data['text'] = data['text'][:, :(current_seqlen + 1)].contiguous()
         elif 'seqlen_reshape' in data_sampler_state_dict['current_difficulties']:
             args.data_efficiency_curriculum_learning_seqlen_type = 'seqlen_reshape'
             current_seqlen = data_sampler_state_dict['current_difficulties']['seqlen_reshape']
             if current_seqlen < args.seq_length:
                 orig_num_token = torch.numel(data['text'])
-                reshape_len = (data['text'].size()[1] // (current_seqlen+1)) * (current_seqlen+1)
-                data['text'] = torch.cat((data['text'][:, :reshape_len].contiguous().view(-1, current_seqlen+1),
-                    data['text'][:, -(current_seqlen+1):]), 0).contiguous()
-                num_row = math.ceil(orig_num_token / (current_seqlen+1))
+                reshape_len = (data['text'].size()[1] // (current_seqlen + 1)) * (current_seqlen + 1)
+                data['text'] = torch.cat((data['text'][:, :reshape_len].contiguous().view(-1, current_seqlen + 1),
+                                          data['text'][:, -(current_seqlen + 1):]), 0).contiguous()
+                num_row = math.ceil(orig_num_token / (current_seqlen + 1))
                 num_row = min(num_row, data['text'].size()[0])
                 if num_row > 1 and num_row % 2 != 0:
                     num_row -= 1
@@ -184,7 +202,7 @@ def loss_func(loss_mask, moe_loss, mos_loss, output_tensor):
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-    
+
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
     if args.mos or args.kd:
@@ -202,12 +220,13 @@ def loss_func(loss_mask, moe_loss, mos_loss, output_tensor):
             loss = loss + moe_loss
             return loss, {'lm loss': averaged_loss[0], 'moe loss': moe_loss}
 
+
 def calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, attention_mask):
     mos_loss = 0
     alpha = args.kd_alpha_ce
     beta = args.kd_beta_ce
     kd_temp = args.kd_temp
-    
+
     if teacher_model:
         with torch.no_grad():
             if args.curriculum_learning_legacy and args.curriculum_seqlen < args.seq_length:
@@ -218,15 +237,18 @@ def calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, at
                 attention_mask = attention_mask[:, :, :curriculum_seqlen, :curriculum_seqlen].contiguous()
                 # No need to truncate labels as we do not need it for the teacher logits
             tea_output, *tea_other_losses = teacher_model(tokens, position_ids, attention_mask)
-            assert stu_output.size() == tea_output.size(), 'teacher and student output should match in size. Student: {}, Teacher: {}, CL seq length {}'.format(stu_output.size(), tea_output.size(), args.curriculum_seqlen)
+            assert stu_output.size() == tea_output.size(), 'teacher and student output should match in size. Student: {}, Teacher: {}, CL seq length {}'.format(
+                stu_output.size(), tea_output.size(), args.curriculum_seqlen)
 
         student_logits = F.log_softmax(stu_output / kd_temp, dim=2)
-        tea_logits = F.softmax(tea_output / kd_temp, dim=2) # The target logits is expected to be probabilities. If we use log_softmax, then we need to set target_log to true when initializing the KLDivLoss.
+        tea_logits = F.softmax(tea_output / kd_temp,
+                               dim=2)  # The target logits is expected to be probabilities. If we use log_softmax, then we need to set target_log to true when initializing the KLDivLoss.
 
         mos_loss = kd_temp * kd_temp * nn.KLDivLoss(reduction='batchmean')(student_logits, tea_logits)
 
         mos_loss = mos_loss.div(args.seq_length) * beta
     return mos_loss
+
 
 def forward_step(data_iterator, model):
     """Forward step."""
@@ -242,19 +264,19 @@ def forward_step(data_iterator, model):
     if args.data_efficiency_curriculum_learning:
         args.curriculum_seqlen = tokens.size()[1]
         if hasattr(args, 'data_efficiency_curriculum_learning_seqlen_type') and \
-            args.data_efficiency_curriculum_learning_seqlen_type == 'seqlen_reshape':
+                args.data_efficiency_curriculum_learning_seqlen_type == 'seqlen_reshape':
             args.data_efficiency_curriculum_learning_numel = torch.numel(tokens)
 
     if args.mos or args.kd:
         # The forward func can return either the loss or the logits, depending on whether passing in the labels or not.
-        stu_output, *other_losses = model(tokens, position_ids, attention_mask)
+        stu_output, *other_losses = model(input_ids=tokens, position_ids=position_ids, attention_mask=attention_mask)
         if args.curriculum_learning_legacy and args.curriculum_seqlen < args.seq_length:
             assert args.curriculum_seqlen is not None
             labels = labels[:, :args.curriculum_seqlen].contiguous()
         output_tensor = mpu.vocab_parallel_cross_entropy(stu_output.contiguous().float(), labels)
     else:
-        output_tensor, *other_losses = model(tokens, position_ids, attention_mask,
-                                            labels=labels)
+        output_tensor, *other_losses = model(input_ids=tokens, position_ids=position_ids, attention_mask=attention_mask,
+                                             labels=labels)
     if args.curriculum_learning_legacy and args.curriculum_seqlen < args.seq_length:
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 
@@ -269,8 +291,8 @@ def forward_step(data_iterator, model):
         assert model.training
         if args.teacher_forward and args.teacher_model is not None:
             mos_loss = calculate_mos_loss(args, stu_output,
-                args.teacher_model[0], tokens, position_ids, attention_mask)
-    
+                                          args.teacher_model[0], tokens, position_ids, attention_mask)
+
     # Output_tensor stores the standard loss, loos_func calculates the total loss.
     return output_tensor, partial(loss_func, loss_mask, moe_loss, mos_loss)
 
