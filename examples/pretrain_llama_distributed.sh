@@ -5,14 +5,14 @@ set -ex
 # Change the below configurations here
 BASE_PATH=./tmp
 DS_CONFIG=${BASE_PATH}/deepspeed.json
-DATASET_1="./tmp/data/bookcorpus_train_1m_text_sentence"
+DATASET_1="/cpfs01/user/yezhisheng/llama_reproduce/Megatron-DeepSpeed/data/my-gpt2_text_document"
 DATASET="1 ${DATASET_1}"
 CHECKPOINT_PATH=./tmp
-TOKENIZER_PATH=./tmp/tokenizer.model # offical llama tokenizer.model
+TOKENIZER_PATH=/cpfs01/user/yezhisheng/hf_models/models/llama-7B/tokenizer.model # offical llama tokenizer.model
 
-TP=2
-PP=2
-ZERO_STAGE=0
+TP=1
+PP=1
+ZERO_STAGE=1
 
 GPUS_PER_NODE=8
 MASTER_ADDR=localhost
@@ -24,10 +24,10 @@ HIDDEN_SIZE=2048 # e.g. llama-13b: 5120
 FFN_HIDDEN_SIZE=5504 # e.g. llama-13b: 13824
 NUM_LAYERS=24 # e.g. llama-13b: 40
 NUM_HEADS=16 # e.g. llama-13b: 40
-SEQ_LENGTH=2048
+SEQ_LENGTH=4096
 
-MICRO_BATCH_SIZE=4
-GLOBAL_BATCH_SIZE=16 # e.g. llama: 4M tokens
+MICRO_BATCH_SIZE=1
+GLOBAL_BATCH_SIZE=32 # e.g. llama: 4M tokens
 TRAIN_STEPS=250000 # e.g. llama: 1T tokens / 4M tokens_per_batch = 250000 steps
 LR=3e-4
 MIN_LR=3e-5
@@ -59,9 +59,13 @@ cat <<EOT > $DS_CONFIG
   "zero_optimization": {
     "stage": $ZERO_STAGE
   },
+  "gradient_accumulation_steps": 4,
 
   "bf16": {
     "enabled": true
+  },
+  "amp": {
+      "enabled": true,
   }
 }
 EOT
@@ -70,7 +74,7 @@ ds_args=""
 ds_args=" --deepspeed ${ds_args}"
 ds_args=" --deepspeed_config=$DS_CONFIG ${ds_args}"
 ds_args=" --zero-stage=$ZERO_STAGE ${ds_args}"
-ds_args=" --deepspeed-activation-checkpointing ${ds_args}"
+# ds_args=" --deepspeed-activation-checkpointing ${ds_args}"
 
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
