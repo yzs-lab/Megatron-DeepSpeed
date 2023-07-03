@@ -105,7 +105,7 @@ def get_args():
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--tokenizer-type', type=str, required=True,
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer'],
+                                'GPT2BPETokenizer', 'SPTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
@@ -138,6 +138,9 @@ def get_args():
     args.make_vocab_size_divisible_by = 128
     args.tensor_model_parallel_size = 1
     args.vocab_extra_ids = 0
+
+    if args.tokenizer_type == 'SPTokenizer':
+        args.tokenizer_model_file = '/cpfs01/user/yezhisheng/hf_models/models/llama-7B/tokenizer.model'
 
     return args
 

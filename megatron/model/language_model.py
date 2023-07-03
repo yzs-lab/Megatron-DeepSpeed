@@ -27,7 +27,6 @@ from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal, scaled_init_method_normal
 from megatron.model.rotary_pos_embedding import RotaryEmbedding
 
-
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
     """LM logits using word embedding weights."""

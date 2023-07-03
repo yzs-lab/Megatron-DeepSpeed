@@ -603,3 +603,43 @@ We recommend using the `--json` argument when using WikiExtractor, which will du
 
 ## Collecting GPT Webtext Data
 We utilize the publicly available [OpenWebText](https://github.com/eukaryote31/openwebtext) library from [jcpeterson](https://github.com/jcpeterson/openwebtext) and [eukaryote31's](https://github.com/eukaryote31/openwebtext) work to download urls. We then filtered, cleaned, and deduplicated all downloaded content according to the procedure described in our [openwebtext](./tools/openwebtext) directory. For reddit URLs corresponding to content up to October 2018 we arrived at approximately 37GB of content.
+
+
+# Pretrain LLaMA
+
+Original implementation of LLaMA from https://github.com/microsoft/Megatron-DeepSpeed/pull/139.
+
+## Setup
+
+0. torch 2.0.0
+1. install apex
+2. install deepspeed v0.8.0 (compiling from source)
+3. clone megatron-deepspeed and working inside the repo
+
+### data preprocessing
+
+using LLaMA tokenizer
+
+```bash
+wget https://huggingface.co/bigscience/misc-test-data/resolve/main/stas/oscar-1GB.jsonl.xz
+wget https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json
+wget https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt
+xz -d oscar-1GB.jsonl.xz
+python tools/preprocess_data.py \
+    --input oscar-1GB.jsonl \
+    --output-prefix my-gpt2 \
+    --vocab gpt2-vocab.json \
+    --dataset-impl mmap \
+    --tokenizer-type SPTokenizer \
+    --merge-file gpt2-merges.txt \
+    --append-eod \
+    --workers 128
+```
+
+### pretraining
+
+```bash
+conda activate /cpfs01/user/yezhisheng/miniconda3/envs/yzs_pt21_ds_megatron
+sh examples/pretrain_llama_distributed.sh
+```
+
