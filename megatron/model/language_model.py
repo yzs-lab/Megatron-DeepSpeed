@@ -25,6 +25,7 @@ from megatron.model.enums import LayerType, AttnMaskType
 from megatron.model.transformer import ParallelTransformer
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal, scaled_init_method_normal
+from megatron.model.rotary_pos_embedding import RotaryEmbedding
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
@@ -47,7 +48,13 @@ def get_language_model(num_tokentypes, add_pooler,
                        encoder_attn_mask_type, init_method=None,
                        scaled_init_method=None, add_decoder=False,
                        decoder_attn_mask_type=AttnMaskType.causal,
-                       pre_process=True, post_process=True, num_experts=[1]):
+                       pre_process=True, post_process=True, num_experts=[1],
+                       position_embedding_type='learned_absolute',
+                       share_embeddings_and_output_weights=True,
+                       activation='gelu',
+                       normalization='layernorm',
+                       bias=True,
+                       ):
     """Build language model and return along with the key to save."""
     args = get_args()
 
@@ -69,7 +76,13 @@ def get_language_model(num_tokentypes, add_pooler,
         add_pooler=add_pooler,
         pre_process=pre_process,
         post_process=post_process,
-        num_experts=num_experts)
+        num_experts=num_experts,
+        position_embedding_type=position_embedding_type,
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+        activation=activation,
+        normalization=normalization,
+        bias=bias
+    )
     # key used for checkpoints.
     language_model_key = 'language_model'
 
@@ -121,12 +134,14 @@ class Embedding(MegatronModule):
                  max_sequence_length,
                  embedding_dropout_prob,
                  init_method,
-                 num_tokentypes=0):
+                 num_tokentypes=0,
+                 position_embedding_type='learned_absolute', ):
         super(Embedding, self).__init__()
 
         self.hidden_size = hidden_size
         self.init_method = init_method
         self.num_tokentypes = num_tokentypes
+        self.position_embedding_type = position_embedding_type
 
         args = get_args()
 
@@ -137,11 +152,12 @@ class Embedding(MegatronModule):
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
-        self.position_embeddings = torch.nn.Embedding(
-            max_sequence_length, self.hidden_size)
-        self._position_embeddings_key = 'position_embeddings'
-        # Initialize the position embeddings.
-        self.init_method(self.position_embeddings.weight)
+        if self.position_embedding_type == 'learned_absolute':
+            # Position embedding (serial).
+            self.position_embeddings = torch.nn.Embedding(max_sequence_length, self.hidden_size)
+            self._position_embeddings_key = 'position_embeddings'
+            # Initialize the position embeddings.
+            self.init_method(self.position_embeddings.weight)
 
         # Token type embedding.
         # Add this as an optional field that can be added through
@@ -176,17 +192,20 @@ class Embedding(MegatronModule):
         args = get_args()
         self.init_method(self.tokentype_embeddings.weight)
 
-    def forward(self, input_ids, position_ids, tokentype_ids=None):
+    def forward(self, input_ids, position_ids=None, tokentype_ids=None):
         # Embeddings.
         words_embeddings = self.word_embeddings(input_ids)
-        position_embeddings = self.position_embeddings(position_ids)
-        embeddings = words_embeddings + position_embeddings
+        if self.position_embedding_type == 'learned_absolute':
+            assert position_ids is not None
+            position_embeddings = self.position_embeddings(position_ids)
+            embeddings = words_embeddings + position_embeddings
+        else:
+            embeddings = words_embeddings
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
             embeddings = embeddings + self.tokentype_embeddings(tokentype_ids)
         else:
             assert self.tokentype_embeddings is None
-
         # Dropout.
         embeddings = self.embedding_dropout(embeddings)
 
@@ -199,13 +218,14 @@ class Embedding(MegatronModule):
         state_dict_ = {}
         state_dict_[self._word_embeddings_key] \
             = self.word_embeddings.state_dict(destination, prefix, keep_vars)
-        state_dict_[self._position_embeddings_key] \
-            = self.position_embeddings.state_dict(
+        if self.position_embedding_type == 'learned_absolute':
+            state_dict_[self._position_embeddings_key] \
+                = self.position_embeddings.state_dict(
                 destination, prefix, keep_vars)
         if self.num_tokentypes > 0:
             state_dict_[self._tokentype_embeddings_key] \
                 = self.tokentype_embeddings.state_dict(
-                    destination, prefix, keep_vars)
+                destination, prefix, keep_vars)
 
         return state_dict_
 
@@ -224,17 +244,17 @@ class Embedding(MegatronModule):
                         = state_dict[key]
         self.word_embeddings.load_state_dict(state_dict_, strict=strict)
 
-        # Position embedding.
-        if self._position_embeddings_key in state_dict:
-            state_dict_ = state_dict[self._position_embeddings_key]
-        else:
-            # for backward compatibility.
-            state_dict_ = {}
-            for key in state_dict.keys():
-                if 'position_embeddings' in key:
-                    state_dict_[key.split('position_embeddings.')[1]] \
-                        = state_dict[key]
-        self.position_embeddings.load_state_dict(state_dict_, strict=strict)
+        if self.position_embedding_type == 'learned_absolute':
+            # Position embedding.
+            if self._position_embeddings_key in state_dict:
+                state_dict_ = state_dict[self._position_embeddings_key]
+            else:
+                # for backward compatibility.
+                state_dict_ = {}
+                for key in state_dict.keys():
+                    if 'position_embeddings' in key:
+                        state_dict_[key.split('position_embeddings.')[1]] = state_dict[key]
+            self.position_embeddings.load_state_dict(state_dict_, strict=strict)
 
         # Tokentype embedding.
         if self.num_tokentypes > 0:
@@ -272,7 +292,7 @@ class EmbeddingPipe(Embedding):
             tokentype_ids = inputs[3]
         else:
             tokentype_ids = None
-        
+
         embeddings = super().forward(input_ids, position_ids, tokentype_ids=tokentype_ids)
 
         # If cmd args has attn_mask, we don't forward it as an activation.
@@ -282,11 +302,66 @@ class EmbeddingPipe(Embedding):
             assert False
             return embeddings, attention_mask
 
-
     @property
     def word_embeddings_weight(self):
         """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
         return self.word_embeddings.weight
+
+
+class LMHead(MegatronModule):
+    """Causal LM head for Llama
+
+    Arguments:
+        vocab_size: size of vocabulary.
+        hidden_size: hidden size
+        gather_output: wether output logits being gathered or not.
+        init_method: init method for weight initialization
+    """
+
+    def __init__(self, hidden_size, vocab_size, init_method, parallel_output=True):
+        super(LMHead, self).__init__()
+        args = get_args()
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        self.init_method = init_method
+        self.parallel_output = parallel_output
+
+        self.lm_head = mpu.ColumnParallelLinear(input_size=self.hidden_size,
+                                                output_size=self.vocab_size,
+                                                bias=False,
+                                                gather_output=not self.parallel_output,
+                                                skip_bias_add=True,
+                                                init_method=self.init_method, )
+
+    def forward(self, inputs):
+        logits, _ = self.lm_head(inputs)
+        return logits
+
+
+class LMHeadPipe(LMHead):
+
+    def forward(self, inputs, **kwargs):
+        assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
+        if isinstance(inputs, tuple):
+            hidden_states = inputs[0]
+        else:
+            hidden_states = inputs
+
+        if not hasattr(self, '_args'):
+            self._args = get_args()
+
+        if hasattr(self._args, 'attn_mask'):
+            attention_mask = None
+        else:
+            attention_mask = inputs[1]
+
+        logits = super().forward(hidden_states)
+
+        # If cmd args has attn_mask, we don't forward it as an activation.
+        if hasattr(self._args, 'attn_mask'):
+            return logits
+        else:
+            return logits, attention_mask
 
 
 class TransformerLanguageModel(MegatronModule):
@@ -312,7 +387,13 @@ class TransformerLanguageModel(MegatronModule):
                  add_pooler=False,
                  pre_process=True,
                  post_process=True,
-                 num_experts=[1]):
+                 num_experts=[1],
+                 position_embedding_type='learned_absolute',
+                 share_embeddings_and_output_weights=True,
+                 activation='gelu',
+                 normalization='layernorm',
+                 bias=True
+                 ):
         super(TransformerLanguageModel, self).__init__()
         args = get_args()
 
@@ -326,16 +407,25 @@ class TransformerLanguageModel(MegatronModule):
         self.decoder_attn_mask_type = decoder_attn_mask_type
         self.add_pooler = add_pooler
         self.num_experts = num_experts
+        self.position_embedding_type = position_embedding_type
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.activation = activation
+        self.normalization = normalization
 
         # Embeddings.
         if self.pre_process:
-            self.embedding = Embedding(self.hidden_size,
-                                       args.padded_vocab_size,
-                                       args.max_position_embeddings,
-                                       args.hidden_dropout,
-                                       self.init_method,
-                                       self.num_tokentypes)
+            self.embedding = Embedding(hidden_size=self.hidden_size,
+                                       vocab_size=args.padded_vocab_size,
+                                       max_sequence_length=args.max_position_embeddings,
+                                       init_method=self.init_method,
+                                       num_tokentypes=self.num_tokentypes,
+                                       embedding_dropout_prob=args.hidden_dropout,
+                                       position_embedding_type=self.position_embedding_type, )
             self._embedding_key = 'embedding'
+
+        if position_embedding_type == 'rope':
+            rotary_dim = self.hidden_size // args.num_attention_heads
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
 
         # Transformer.
         self.encoder = ParallelTransformer(
@@ -344,7 +434,11 @@ class TransformerLanguageModel(MegatronModule):
             self_attn_mask_type=self.encoder_attn_mask_type,
             pre_process=self.pre_process,
             post_process=self.post_process,
-            num_experts=self.num_experts
+            num_experts=self.num_experts,
+            activation=self.activation,
+            normalization=self.normalization,
+            position_embedding_type=self.position_embedding_type,
+            bias=bias
         )
         self._encoder_key = 'encoder'
 
@@ -357,7 +451,11 @@ class TransformerLanguageModel(MegatronModule):
                 output_layer_init_method,
                 layer_type=LayerType.decoder,
                 self_attn_mask_type=self.decoder_attn_mask_type,
-                num_experts=self.num_experts)
+                num_experts=self.num_experts,
+                activation=self.activation,
+                normalization=self.normalization,
+                position_embedding_type=self.position_embedding_type,
+                bias=bias)
             self._decoder_key = 'decoder'
 
         if self.post_process:
@@ -366,11 +464,21 @@ class TransformerLanguageModel(MegatronModule):
                 self.pooler = Pooler(self.hidden_size, self.init_method)
                 self._pooler_key = 'pooler'
 
+            if not self.share_embeddings_and_output_weights:
+                self.output_layer = mpu.ColumnParallelLinear(
+                    self.hidden_size,
+                    args.padded_vocab_size,
+                    bias=False,
+                    # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
+                    init_method=self.init_method,
+                )
+                self._output_layer_key = 'output_layer'
+
     def set_input_tensor(self, input_tensor):
         """ See megatron.model.transformer.set_input_tensor()"""
         self.encoder.set_input_tensor(input_tensor)
 
-    def forward(self, enc_input_ids, enc_position_ids, enc_attn_mask,
+    def forward(self, enc_input_ids, enc_attn_mask, enc_position_ids=None,
                 dec_input_ids=None, dec_position_ids=None, dec_attn_mask=None,
                 enc_dec_attn_mask=None, tokentype_ids=None, layer_past=None,
                 get_key_value=False, pooling_sequence_index=0,
@@ -378,18 +486,27 @@ class TransformerLanguageModel(MegatronModule):
 
         # Embeddings.
         if self.pre_process:
-            embedding_output = self.embedding(enc_input_ids, enc_position_ids,
-                                              tokentype_ids=tokentype_ids)
+            embedding_output = self.embedding(enc_input_ids, position_ids=enc_position_ids, tokentype_ids=tokentype_ids)
             encoder_input = embedding_output
         else:
             encoder_input = None
 
+        if self.position_embedding_type == 'rope':
+            if self.encoder.input_tensor is not None:
+                rotary_pos_emb = self.rotary_pos_emb(self.encoder.input_tensor.size(0)) # encoder_input: [seq_len,bs,dim]
+            else:
+                rotary_pos_emb = self.rotary_pos_emb(encoder_input.size(1)) # encoder_input: [bs,seq_len,dim]
+        else:
+            rotary_pos_emb = None
+
         # encoder.
         if enc_hidden_states is None:
             encoder_output, *moe_losses = self.encoder(encoder_input,
-                                          enc_attn_mask,
-                                          layer_past=layer_past,
-                                          get_key_value=get_key_value)
+                                                       enc_attn_mask,
+                                                       layer_past=layer_past,
+                                                       get_key_value=get_key_value,
+                                                       rotary_pos_emb=(rotary_pos_emb, None, None) if rotary_pos_emb is not None else None,
+                                                       )
         else:
             encoder_output = enc_hidden_states.to(encoder_input.dtype)
             moe_losses = []
@@ -412,12 +529,13 @@ class TransformerLanguageModel(MegatronModule):
         dec_embedding_output = self.embedding(dec_input_ids,
                                               dec_position_ids)
         # decoder
+        # TODO, @LydiaXiaohongLi, rotary_pos_emb for encoder-decoder models? Megatron-LM also not implemented?
         decoder_output, *moe_losses = self.decoder(dec_embedding_output,
-                                      dec_attn_mask,
-                                      layer_past=layer_past,
-                                      get_key_value=get_key_value,
-                                      encoder_output=encoder_output,
-                                      enc_dec_attn_mask=enc_dec_attn_mask)
+                                                   dec_attn_mask,
+                                                   layer_past=layer_past,
+                                                   get_key_value=get_key_value,
+                                                   encoder_output=encoder_output,
+                                                   enc_dec_attn_mask=enc_dec_attn_mask)
 
         if self.add_pooler and self.post_process:
             return (decoder_output, encoder_output, pooled_output, *moe_losses)
@@ -433,9 +551,9 @@ class TransformerLanguageModel(MegatronModule):
         if self.pre_process:
             state_dict_[self._embedding_key] \
                 = self.embedding.state_dict_for_save_checkpoint(
-                    destination, prefix, keep_vars)
-        encoder_state_dict = self.encoder.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
+        encoder_state_dict = self.encoder.state_dict_for_save_checkpoint(
+            destination, prefix, keep_vars)
         if args.random_ltd:
             # When using random-LTD, it is required to call remove_random_ltd_state_dict
             # during model checkpoint saving to transfer the random-LTD-wrapped
@@ -451,17 +569,17 @@ class TransformerLanguageModel(MegatronModule):
         # the same logic
         for key in list(encoder_state_dict.keys()):
             if 'expert' in key and 'moe.gate.wg.weight' not in key:
-                moe_state_dict[self._encoder_key+key] = encoder_state_dict.pop(key)
+                moe_state_dict[self._encoder_key + key] = encoder_state_dict.pop(key)
         state_dict_[self._encoder_key] = encoder_state_dict
         if self.post_process:
             if self.add_pooler:
                 state_dict_[self._pooler_key] \
                     = self.pooler.state_dict_for_save_checkpoint(
-                        destination, prefix, keep_vars)
+                    destination, prefix, keep_vars)
         if self.add_decoder:
             state_dict_[self._decoder_key] \
                 = self.decoder.state_dict_for_save_checkpoint(
-                    destination, prefix, keep_vars)
+                destination, prefix, keep_vars)
         state_dict_["moe_state_dict"] = moe_state_dict
         return state_dict_
 
@@ -502,7 +620,7 @@ class TransformerLanguageModel(MegatronModule):
         for key in state_dict_.keys():
             if '.attention.' in key and key not in encoder_state_dict_keys:
                 state_dict_self_attention[key.replace(".attention.",
-                    ".self_attention.")] = state_dict_[key]
+                                                      ".self_attention.")] = state_dict_[key]
             else:
                 state_dict_self_attention[key] = state_dict_[key]
         state_dict_ = state_dict_self_attention

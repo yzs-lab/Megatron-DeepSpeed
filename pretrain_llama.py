@@ -24,7 +24,7 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel, GPTModelPipe
+from megatron.model import LlamaModel, LlamaModelPipe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
@@ -54,7 +54,7 @@ def model_provider(pre_process=True, post_process=True):
                              enabled=args.zero_stage == 3,
                              mpu=mpu):
         if args.deepspeed and not args.no_pipeline_parallel:
-            model = GPTModelPipe(
+            model = LlamaModelPipe(
                 num_tokentypes=0,
                 parallel_output=True
             )
@@ -95,7 +95,7 @@ def model_provider(pre_process=True, post_process=True):
 
 
         else:
-            model = GPTModel(
+            model = LlamaModel(
                 num_tokentypes=0,
                 parallel_output=True,
                 pre_process=pre_process,
@@ -344,7 +344,7 @@ def git_ds_info():
 
 
 if __name__ == "__main__":
-    git_ds_info()
+    # git_ds_info()
     pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
              data_post_process=data_post_process)
