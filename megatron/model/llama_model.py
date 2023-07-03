@@ -65,8 +65,8 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         return loss
 
 
-class GPTModel(MegatronModule):
-    """GPT-2 Language model."""
+class LlamaModel(MegatronModule):
+    """LLaMA Language model."""
 
     def __init__(self,
                  num_tokentypes=0,
@@ -74,7 +74,7 @@ class GPTModel(MegatronModule):
                  pre_process=True,
                  post_process=True,
                  return_moe_loss=True):
-        super(GPTModel, self).__init__()
+        super(LlamaModel, self).__init__()
         args = get_args()
 
         self.parallel_output = parallel_output
@@ -196,7 +196,7 @@ def CrossEntropy(output, labels):
     return loss
 
 
-class GPTModelPipe(PipelineModule, MegatronModule):
+class LlamaModelPipe(PipelineModule, MegatronModule):
     """GPT-2 Language model."""
 
     def __init__(self,
